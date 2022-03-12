@@ -1,7 +1,5 @@
 from datetime import time, datetime, date, timedelta
 import dateutil.parser
-#import robin_stocks as r
-#import pyotp
 import numpy as np
 import pandas as pd
 import pandas_ta as ta # For MACD
