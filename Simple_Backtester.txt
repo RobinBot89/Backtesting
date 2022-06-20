@@ -1,0 +1,266 @@
+from datetime import time, datetime, date, timedelta
+import matplotlib.pyplot as plt
+import dateutil.parser
+import numpy as np
+import pandas as pd
+import pandas_ta as ta # For MACD
+import math
+from statistics import stdev
+import smtplib
+from pandas_datareader import data as pdr
+import yfinance as yf
+
+yf.pdr_override()
+from os import system
+from os import path
+import sys
+import calendar
+#Setup Backtest info
+years=int(input('How many Years of Data?'))
+time=years*365
+
+my_portfolio={}
+portfolio_count=int(input('How many tickers in your portfolio?'))
+start_cash=int(input('How much starting cash?'))
+for item in range(portfolio_count):
+    ticker=input('What is the ticker symbol?')
+    percent=int(input('What is the desired % allocation?'))
+    percent=percent/100
+    my_portfolio[ticker]=percent
+
+def round_down(n, decimals=0):
+    multiplier = 10 ** decimals
+    return math.floor(n * multiplier) / multiplier
+
+time=round_down(time)
+print(f'Days is set to {time}')
+
+def run_backtest(ticker,time,cash):
+    def get_df_from_yahoo(yfinance_ticker,time):
+        print(f'Creating DF from Yahoo Data {yfinance_ticker}.')
+
+        files = []
+
+        # Function to get yahoo data
+        def getData(yfinance_ticker,time):
+            today = datetime.today()
+            # Use 365 total time delta in days, even though 252 trading days in year
+            start_date = today - timedelta(time)
+            data = pdr.get_data_yahoo(yfinance_ticker, start=start_date, end=today)
+            dataname = yfinance_ticker
+            files.append(dataname)
+            SaveData(data, dataname)
+
+        # Function to save data to CSV
+        def SaveData(df, filename):
+            df.to_csv("C:/Users/james/Anaconda Environments/Backtester" + filename + '.csv')
+
+        getData(yfinance_ticker,time)
+        df = pd.read_csv("C:/Users/james/Anaconda Environments/Backtester" + yfinance_ticker + '.csv')
+
+        # Drop any N/A or - in dataframe
+        df.dropna(axis=0, how='any', inplace=True)
+
+        return df
+
+    def add_indicators(df):
+        
+        df['PP'] = (df['High'].shift(1)+df['Low'].shift(1)+df['Close'].shift(1))/3
+        df['PPs1'] = (df['PP']*2)-df['High'].shift(1)
+        df['PPs2'] =  df['PP']-(df['High'].shift(1)-df['Low'].shift(1))
+        df['PPr1'] = (df['PP']*2)-df['Low'].shift(1)
+        df['PPr2'] = df['PP'] + (df['High'].shift(1)-df['Low'].shift(1))
+        df['8SMA'] = df['Close'].rolling(8).mean()
+        df['20SMA'] = df['Close'].rolling(20).mean()
+        df['50SMA'] = df['Close'].rolling(50).mean()
+        df['200SMA'] = df['Close'].rolling(200).mean()
+        df['Vol_20SMA'] = df['Volume'].rolling(20).mean().round(decimals=0)
+        # Creates a True/False Column for when the 8SMA is below the 20SMA
+        df['Below'] = df['8SMA'] < df['20SMA']
+        df['VolSMA+1STD'] = df['Vol_20SMA'] + df['Volume'].rolling(20).std()
+        df['Close+1STD'] = df['20SMA'] + df['Close'].rolling(20).std()
+        df['Close-1STD'] = df['20SMA'] - df['Close'].rolling(20).std()
+        df['Buy_Mark']=0
+        df['Sell_Mark']=0
+        df['Last_Cross_Below'] = df['8SMA'] < df['20SMA']
+
+        
+
+        #RSI 
+        #Reference: https://www.youtube.com/watch?v=2H2Gd7zYVA8&t=408s
+        #Some series not included in DF for keeping things clean
+        df['Movement'] = df['Close'].diff()
+        UpwardMovement= df['Movement'].where(df['Movement']>0)
+        UpwardMovement.replace(np.nan,0,inplace=True)
+        DownwardMovement= abs(df['Movement'].where(df['Movement']<0))
+        DownwardMovement.replace(np.nan,0,inplace=True)
+        AveragedUpwardMovement=UpwardMovement.rolling(14).mean().round(decimals=2)
+        AveragedDownwardMovement=DownwardMovement.rolling(14).mean().round(decimals=2)
+        RelativeStrength=AveragedUpwardMovement/AveragedDownwardMovement
+        RelativeStrength=RelativeStrength.round(decimals=2)
+        df['RSI']=100-(100/(RelativeStrength+1))
+        df['RSI']=df['RSI'].round(decimals=2)
+
+        #MACD
+        # Calculate MACD values using the pandas_ta library
+        # Reference: https://www.alpharithms.com/calculate-macd-python-272222/
+        df.ta.macd(close='close', fast=12, slow=26, signal=9, append=True)
+        my_df['MACD_Buy_Sig']=my_df['MACD_12_26_9']>my_df['MACDs_12_26_9']
+        my_df['MACD_Sell_Sig']=my_df['MACD_12_26_9']<my_df['MACDs_12_26_9']
+        return df
+    
+    my_df=get_df_from_yahoo(ticker,time)
+    my_df=add_indicators(my_df)
+    gold=get_df_from_yahoo('GC=F',time)
+    gold=add_indicators(gold)
+    dji=get_df_from_yahoo('^DJI',time)
+    dji=add_indicators(dji)
+    
+    #Global Vars
+    cash=cash
+    print(cash)
+    start_val=cash
+    shares_owned=0
+    shares_to_buy=0
+    shares_to_sell=0
+    buy=False
+    sell=False
+    account_val=0
+    
+    #Runs our buy/sell strategy
+    def run_strategy(df,gold,dji,today,cash,shares_owned, account_val,permit_buy,permit_sell):
+        #Init Vars
+        price=df['Close'].iloc[today]
+        volume=df['Volume'].iloc[today]
+        sma8=df['8SMA'].iloc[today]
+        sma20=df['20SMA'].iloc[today]
+        sma200=df['200SMA'].iloc[today]
+        #Pivot Points
+        pp,r1,r2,s1,s2=df['PP'].iloc[today],df['PPr1'].iloc[today],df['PPr2'].iloc[today],df['PPs1'].iloc[today],df['PPs2'].iloc[today]
+        
+        #Safety Net w/ Last Cross below, if none-type then Set super high
+        x_below_index=df.where(df['Last_Cross_Below']==True).last_valid_index()
+        if x_below_index==None:
+            last_cross_below = price*2
+        else:
+            last_cross_below=round(df['Close'].iloc[x_below_index],2)
+
+        volume_sma20_plus_1std = round(df['VolSMA+1STD'].iloc[-1], 2)
+        price_sma20_plus_1std = round(df['Close+1STD'].iloc[-1], 2)
+        shares_to_buy=0
+        shares_to_sell=0
+        buy=False
+        sell=False
+        macd_buy=df['MACD_Buy_Sig'].iloc[today]
+        macd_sell=df['MACD_Sell_Sig'].iloc[today]
+        rsi_overvalued=False
+        rsi_undervalued=False
+        if df['RSI'].iloc[today]<30:
+            rsi_undervalued=True
+        if df['RSI'].iloc[today]>60:
+            rsi_overvalued=True
+            
+        ###########################################################################
+        #Original Strategy    
+        #Current Strat:
+        #9% annual performance, 3yr timeframe, RYCEY
+        #Buy Logic:
+        if permit_buy:
+            if price>sma20:
+                #print(f'Price Now: {price}> SMA20: {sma20}. Buy Logic >')
+                if sma8>sma20:
+                    #print(f'SMA8: {sma8}>SMA20{sma20}. Buy Logic >>')
+                    if price>last_cross_below:
+                        #print(f'Price:{price}>Last Cross Below: {last_cross_below}. Buy Logic >>>')
+                        if price<price_sma20_plus_1std:
+                            #print(f'Price is under +1STD. Price:{price}, +1STD:{price_sma20_plus_1std}. Buy Logic>>>>')
+                            buy=True
+                            shares_to_buy=round(cash/price)
+                            
+
+        #Sell Logic:
+        #Price has fallen
+        if permit_sell:
+            if price<sma20:
+                #print(f'Price Now: {price}< SMA20: {sma20}. Sell Logic >')
+                #Spike selloff
+                if volume>volume_sma20_plus_1std:
+                    #print(f'Volume being sold indicates selloff. Vol:{volume}>Vol+1STD:{volume_sma20_plus_1std}. Sell Logic >>')
+                    sell=True
+                    shares_to_sell=shares_owned
+        ###########################################################################
+        # copy and paste strategies between # marks
+
+        return buy,sell,shares_to_buy,shares_to_sell
+    
+    # Engine
+    #Iterate thru each day
+    print(f'Starting Cash: ${cash}')
+    for row in range(len(my_df)):
+        #We only want to feed in the data up to that date for making decisions.
+        #otherwise if we use .iloc[:-1] we're looking into the future
+        my_df2=my_df.iloc[:row+1] # for loop starts on 0, 0th row is headers
+        #Update Variables
+        price=my_df['Close'].iloc[row]
+        permit_buy=cash>price
+        permit_sell=shares_owned>0
+        date=my_df['Date'].iloc[row]
+        #Simple Strategy  
+        buy,sell,shares_to_buy,shares_to_sell=run_strategy(my_df2,gold,dji,row,cash,shares_owned, account_val,permit_buy,permit_sell)
+
+
+        #Guarantee buy/sell inversed states
+        if buy==True:
+            sell=False
+        if sell==True:
+            buy=False
+
+            #Strategy sets buy signal/sell signal
+        if  buy==True and permit_buy==True:
+            shares_to_buy=round(cash/my_df['Close'].iloc[row])
+            print(f'Date:{date}, Buying {shares_to_buy}.')
+            shares_owned=shares_owned+shares_to_buy
+            cash=0
+            my_df['Buy_Mark'].iloc[row]=1
+            
+        if buy==True and permit_buy==False:
+            print(f'Couldn\'t buy, cash is {cash}, too low. Share price is {price}.')
+
+        if sell==True and permit_sell==True:
+            shares_to_sell=shares_owned
+            print(f'Date:{date}, Selling {shares_to_sell}.')
+            shares_owned=0
+            cash=round(shares_to_sell*price)
+            my_df['Sell_Mark'].iloc[row]=1
+
+
+        shares_val=round(shares_owned*price)
+        account_val=round(cash+shares_val)
+        annual_performance=round((((account_val/start_val)-1)/years)*100)
+        if buy or sell:
+            print(f'Account Val: {account_val},Shares Held: {shares_owned}, Shares Val:{shares_val}, Cash:{cash}.')
+
+    print(f'Ticker: {ticker}, Ending Date: {date}. Account Value is: {account_val}. Annual Performance: {annual_performance}%')
+    return account_val,my_df
+
+#Iterate thru portfolio
+overall_revenue=0
+for ticker in my_portfolio.keys():
+    cash=my_portfolio[ticker]*start_cash
+    ticker_revenue,df=run_backtest(ticker,time,cash) #Also returns df for printing
+    print(ticker_revenue)
+    overall_revenue=overall_revenue+ticker_revenue
+    annual_performance=round(((overall_revenue/start_cash)-1)*100)/years
+    
+    ax = df.plot(kind='line', x='Date', y=['Close','PPs2','PPr2'],figsize=(40,10),title=ticker)
+    for row in range(len(df)):
+        if df["Buy_Mark"].iloc[row]==1:
+            ax.axvline(x=row, color="green", linestyle="dashed")
+
+    for row in range(len(df)):
+        if df["Sell_Mark"].iloc[row]==1:
+            ax.axvline(x=row, color="red", linestyle="dashed")
+
+plt.show()
+
+print(f'Total Revenue from Portfolio: ${overall_revenue}, Annual Performance: {annual_performance}%')
